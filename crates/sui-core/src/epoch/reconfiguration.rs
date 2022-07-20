@@ -7,7 +7,6 @@ use crate::authority_client::AuthorityAPI;
 use async_trait::async_trait;
 use multiaddr::Multiaddr;
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use sui_network::tonic;
@@ -17,6 +16,7 @@ use sui_types::error::{SuiError, SuiResult};
 use sui_types::messages::SignedTransaction;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::sui_system_state::SuiSystemState;
+use tracing::error;
 use typed_store::Map;
 
 #[async_trait]
@@ -52,7 +52,7 @@ where
             unreachable!();
         }
 
-        self.state.halted.store(true, Ordering::SeqCst);
+        self.state.halt_validator();
         while !self.state.batch_notifier.ticket_drained() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -63,10 +63,6 @@ where
     /// all transactions from the last checkpoint of the epoch. This function needs to be called by
     /// a validator that belongs to the committee of the next epoch.
     pub async fn finish_epoch_change(&self) -> SuiResult {
-        assert!(
-            self.state.halted.load(Ordering::SeqCst),
-            "finish_epoch_change called when validator is not halted",
-        );
         if let Some(checkpoints) = &self.state.checkpoints {
             let mut checkpoints = checkpoints.lock();
             let next_cp = checkpoints.get_locals().next_checkpoint;
@@ -105,7 +101,7 @@ where
             })
             .collect();
         let new_committee = Committee::new(next_epoch, votes)?;
-        self.state.insert_new_epoch_info(&new_committee)?;
+        self.state.sign_new_epoch(new_committee.clone())?;
 
         // Reconnect the network if we have an type of AuthorityClient that has a network.
         if A::needs_network_recreation() {
@@ -145,18 +141,21 @@ where
                 .process_transaction(advance_epoch_tx.clone().to_transaction())
                 .await
             {
-                self.state
-                    .handle_certificate(certificate)
-                    .await
-                    .expect("Executing the special cert cannot fail");
-                break;
+                if let Err(err) = self.state.handle_certificate(certificate).await {
+                    error!(
+                        "Failed to execute advance epoch system transaction: {:?}",
+                        err
+                    );
+                } else {
+                    break;
+                }
             }
 
             tokio::time::sleep(WAIT_BETWEEN_EPOCH_TX_QUERY_RETRY).await;
         }
 
         // Resume the validator to start accepting transactions for the new epoch.
-        self.state.unhalt_validator()?;
+        self.state.unhalt_validator();
         Ok(())
     }
 
