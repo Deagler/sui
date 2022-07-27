@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use futures::{stream::FuturesUnordered, StreamExt};
 use sui_benchmark::workloads::workload::get_latest;
+use sui_benchmark::workloads::workload::WorkloadType;
 use sui_config::Config;
 use sui_config::PersistedConfig;
 use sui_core::authority_aggregator::AuthAggMetrics;
@@ -14,6 +15,7 @@ use sui_types::base_types::ObjectID;
 use sui_types::base_types::SuiAddress;
 use tokio::sync::OnceCell;
 
+use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
 use test_utils::objects::generate_gas_objects_with_owner;
 use test_utils::test_keys;
@@ -27,6 +29,7 @@ use std::time::Duration;
 use strum_macros::EnumString;
 use sui_benchmark::workloads::shared_counter::SharedCounterWorkload;
 use sui_benchmark::workloads::transfer_object::TransferObjectWorkload;
+use sui_benchmark::workloads::workload::CombinationWorkload;
 use sui_benchmark::workloads::workload::Payload;
 use sui_benchmark::workloads::workload::Workload;
 use sui_core::authority_aggregator::AuthorityAggregator;
@@ -66,9 +69,6 @@ struct Opts {
     /// Stat collection interval seconds
     #[clap(long, default_value = "10", global = true)]
     pub stat_collection_interval: u64,
-    /// Shared counter or transfer object
-    #[clap(arg_enum, default_value = "owned", global = true, ignore_case = true)]
-    pub transaction_type: TransactionType,
     /// Num server threads
     #[clap(long, default_value = "24", global = true)]
     pub num_server_threads: u64,
@@ -95,6 +95,19 @@ struct Opts {
     /// gateway_config_path, keypair_path and primary_gas_id
     #[clap(long, parse(try_from_str), default_value = "true", global = true)]
     pub local: bool,
+    #[clap(subcommand)]
+    workload_spec: OptWorkloadSpec,
+}
+
+#[derive(Debug, Clone, Parser, Eq, PartialEq, EnumString)]
+#[clap(rename_all = "kebab-case")]
+pub enum OptWorkloadSpec {
+    WorkloadSpec {
+        #[clap(long, default_value = "0")]
+        shared_counter: u32,
+        #[clap(long, default_value = "1")]
+        transfer_object: u32,
+    },
 }
 
 struct Stats {
@@ -107,15 +120,6 @@ struct Stats {
     pub min_latency: Duration,
     pub max_latency: Duration,
     pub duration: Duration,
-}
-
-#[derive(Parser, Debug, Clone, PartialEq, ArgEnum, EnumString, Eq)]
-#[clap(rename_all = "kebab-case")]
-enum TransactionType {
-    #[clap(name = "shared")]
-    SharedCounter,
-    #[clap(name = "owned")]
-    TransferObject,
 }
 
 type RetryType = Box<(TransactionEnvelope<EmptySignInfo>, Box<dyn Payload>)>;
@@ -369,20 +373,37 @@ fn make_workload(
     primary_gas_account_keypair: Arc<KeyPair>,
     opts: &Opts,
 ) -> Box<dyn Workload<dyn Payload>> {
-    match opts.transaction_type {
-        TransactionType::SharedCounter => SharedCounterWorkload::new_boxed(
-            primary_gas_id,
-            primary_gas_account_owner,
-            primary_gas_account_keypair,
-            None,
-        ),
-        TransactionType::TransferObject => TransferObjectWorkload::new_boxed(
-            opts.num_transfer_accounts,
-            primary_gas_id,
-            primary_gas_account_owner,
-            primary_gas_account_keypair,
-        ),
+    let mut workloads = HashMap::<WorkloadType, (u32, Box<dyn Workload<dyn Payload>>)>::new();
+    match opts.workload_spec {
+        OptWorkloadSpec::WorkloadSpec {
+            shared_counter,
+            transfer_object,
+        } => {
+            if shared_counter > 0 {
+                let workload = SharedCounterWorkload::new_boxed(
+                    primary_gas_id,
+                    primary_gas_account_owner,
+                    primary_gas_account_keypair.clone(),
+                    None,
+                );
+                workloads
+                    .entry(WorkloadType::SharedCounter)
+                    .or_insert((shared_counter, workload));
+            }
+            if transfer_object > 0 {
+                let workload = TransferObjectWorkload::new_boxed(
+                    opts.num_transfer_accounts,
+                    primary_gas_id,
+                    primary_gas_account_owner,
+                    primary_gas_account_keypair,
+                );
+                workloads
+                    .entry(WorkloadType::TransferObject)
+                    .or_insert((transfer_object, workload));
+            }
+        }
     }
+    CombinationWorkload::new_boxed(workloads)
 }
 
 #[tokio::main]
