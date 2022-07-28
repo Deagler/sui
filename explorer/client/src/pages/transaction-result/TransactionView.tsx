@@ -14,9 +14,7 @@ import {
 } from '@mysten/sui.js';
 import cl from 'classnames';
 
-import {
-    eventToDisplay,
-} from '../../components/events/eventDisplay';
+import { eventToDisplay } from '../../components/events/eventDisplay';
 import Longtext from '../../components/longtext/Longtext';
 import Tabs from '../../components/tabs/Tabs';
 import SendReceiveView from './SendReceiveView';
